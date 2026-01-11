@@ -16,7 +16,8 @@ api_router = APIRouter(prefix="/api")
 security = HTTPBearer()
 
 # StackForDevs JWT validation
-STACKFORDEVS_JWKS_URL = "https://auth.stackfordevs.com/.well-known/jwks.json"
+STACKFORDEVS_PROJECT_ID = os.getenv("STACKFORDEVS_PROJECT_ID", "c65fa251-2dd5-40a0-ae10-14a9159a4999")
+STACKFORDEVS_JWKS_URL = f"https://auth.stackfordevs.com/projects/{STACKFORDEVS_PROJECT_ID}/.well-known/jwks.json"
 jwks_cache = None
 jwks_cache_time = None
 
