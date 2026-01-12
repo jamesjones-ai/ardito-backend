@@ -4,22 +4,34 @@ from starlette.middleware.cors import CORSMiddleware
 import os
 import logging
 from pydantic import BaseModel, Field, ConfigDict
-from typing import List, Optional, Literal
+from typing import List, Optional, Literal, Dict
 import uuid
 from datetime import datetime, timezone, timedelta
 import jwt
 import random
 import requests
+import secrets
+import hashlib
 
 app = FastAPI(title="Ardito EIP API")
 api_router = APIRouter(prefix="/api")
 security = HTTPBearer()
+
+# JWT Configuration
+JWT_SECRET = os.getenv("JWT_SECRET", secrets.token_urlsafe(32))
+JWT_ALGORITHM = "HS256"
+ACCESS_TOKEN_EXPIRE_MINUTES = 15
+REFRESH_TOKEN_EXPIRE_DAYS = 30
 
 # StackForDevs JWT validation
 STACKFORDEVS_PROJECT_ID = os.getenv("STACKFORDEVS_PROJECT_ID", "c65fa251-2dd5-40a0-ae10-14a9159a4999")
 STACKFORDEVS_JWKS_URL = f"https://auth.stackfordevs.com/projects/{STACKFORDEVS_PROJECT_ID}/.well-known/jwks.json"
 jwks_cache = None
 jwks_cache_time = None
+
+# In-memory storage for users and refresh tokens
+users_store: Dict[str, dict] = {}
+refresh_tokens_store: Dict[str, dict] = {}
 
 def get_jwks():
     global jwks_cache, jwks_cache_time
@@ -42,9 +54,45 @@ def get_jwks():
         raise HTTPException(status_code=500, detail="Authentication service unavailable")
 
 async def get_current_user(credentials: HTTPAuthorizationCredentials = Depends(security)):
-    try:
-        token = credentials.credentials
+    token = credentials.credentials
 
+    # Try our own JWT tokens first (HS256)
+    try:
+        payload = jwt.decode(token, JWT_SECRET, algorithms=[JWT_ALGORITHM])
+
+        # Check if it's an access token
+        if payload.get("type") == "access":
+            user_id = payload.get('sub')
+            email = payload.get('email')
+
+            if not user_id:
+                raise HTTPException(status_code=401, detail="Invalid token payload")
+
+            # Get user from store if available
+            user = users_store.get(user_id)
+            if user:
+                return {
+                    "id": user["id"],
+                    "email": user["email"],
+                    "name": user["name"],
+                    "role": user.get("role", "sponsor")
+                }
+
+            # Fallback to token data
+            return {
+                "id": user_id,
+                "email": email,
+                "name": email.split('@')[0],
+                "role": "sponsor"
+            }
+    except jwt.ExpiredSignatureError:
+        raise HTTPException(status_code=401, detail="Token expired")
+    except jwt.InvalidTokenError:
+        # If our token validation fails, try StackForDevs token validation
+        pass
+
+    # Try StackForDevs JWT validation (RS256 with JWKS)
+    try:
         # Decode without verification first to get the header
         unverified_header = jwt.get_unverified_header(token)
         kid = unverified_header.get('kid')
@@ -92,6 +140,101 @@ async def get_current_user(credentials: HTTPAuthorizationCredentials = Depends(s
     except Exception as e:
         logging.error(f"Token validation error: {e}")
         raise HTTPException(status_code=401, detail="Authentication failed")
+
+# ==================== AUTH HELPERS ====================
+
+def hash_password(password: str) -> str:
+    """Hash a password using SHA-256"""
+    return hashlib.sha256(password.encode()).hexdigest()
+
+def verify_password(plain_password: str, hashed_password: str) -> bool:
+    """Verify a password against its hash"""
+    return hash_password(plain_password) == hashed_password
+
+def create_access_token(user_id: str, email: str) -> str:
+    """Create a JWT access token"""
+    expire = datetime.now(timezone.utc) + timedelta(minutes=ACCESS_TOKEN_EXPIRE_MINUTES)
+    payload = {
+        "sub": user_id,
+        "email": email,
+        "exp": expire,
+        "iat": datetime.now(timezone.utc),
+        "type": "access"
+    }
+    return jwt.encode(payload, JWT_SECRET, algorithm=JWT_ALGORITHM)
+
+def create_refresh_token(user_id: str) -> str:
+    """Create a JWT refresh token"""
+    expire = datetime.now(timezone.utc) + timedelta(days=REFRESH_TOKEN_EXPIRE_DAYS)
+    token_id = str(uuid.uuid4())
+    payload = {
+        "sub": user_id,
+        "exp": expire,
+        "iat": datetime.now(timezone.utc),
+        "jti": token_id,
+        "type": "refresh"
+    }
+    token = jwt.encode(payload, JWT_SECRET, algorithm=JWT_ALGORITHM)
+
+    # Store refresh token
+    refresh_tokens_store[token_id] = {
+        "user_id": user_id,
+        "expires_at": expire.isoformat(),
+        "created_at": datetime.now(timezone.utc).isoformat()
+    }
+
+    return token
+
+def verify_refresh_token(token: str) -> Optional[str]:
+    """Verify a refresh token and return user_id if valid"""
+    try:
+        payload = jwt.decode(token, JWT_SECRET, algorithms=[JWT_ALGORITHM])
+
+        if payload.get("type") != "refresh":
+            return None
+
+        token_id = payload.get("jti")
+        user_id = payload.get("sub")
+
+        # Check if token exists in store
+        if token_id not in refresh_tokens_store:
+            return None
+
+        return user_id
+    except jwt.ExpiredSignatureError:
+        return None
+    except jwt.InvalidTokenError:
+        return None
+
+def revoke_refresh_token(token: str):
+    """Revoke a refresh token"""
+    try:
+        payload = jwt.decode(token, JWT_SECRET, algorithms=[JWT_ALGORITHM], options={"verify_exp": False})
+        token_id = payload.get("jti")
+        if token_id and token_id in refresh_tokens_store:
+            del refresh_tokens_store[token_id]
+    except:
+        pass
+
+# ==================== AUTH MODELS ====================
+
+class LoginRequest(BaseModel):
+    email: str
+    password: str
+
+class RegisterRequest(BaseModel):
+    email: str
+    password: str
+    name: Optional[str] = None
+    company: Optional[str] = None
+
+class RefreshRequest(BaseModel):
+    refreshToken: str
+
+class AuthResponse(BaseModel):
+    accessToken: str
+    refreshToken: str
+    user: dict
 
 # ==================== MODELS ====================
 
@@ -268,7 +411,125 @@ def generate_mock_games():
         ),
     ]
 
-# ==================== ROUTES ====================
+# ==================== AUTH ROUTES ====================
+
+@api_router.post("/auth/register", response_model=AuthResponse)
+async def register(request: RegisterRequest):
+    """Register a new user"""
+    # Check if user already exists
+    if any(u["email"] == request.email for u in users_store.values()):
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Email already registered"
+        )
+
+    # Validate password (must have at least one uppercase letter)
+    if not any(c.isupper() for c in request.password):
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Password must include at least one uppercase letter"
+        )
+
+    # Create user
+    user_id = str(uuid.uuid4())
+    user = {
+        "id": user_id,
+        "email": request.email,
+        "name": request.name or request.email.split('@')[0],
+        "company": request.company,
+        "password_hash": hash_password(request.password),
+        "created_at": datetime.now(timezone.utc).isoformat(),
+        "role": "sponsor"
+    }
+    users_store[user_id] = user
+
+    # Generate tokens
+    access_token = create_access_token(user_id, request.email)
+    refresh_token = create_refresh_token(user_id)
+
+    # Return user without password
+    user_data = {k: v for k, v in user.items() if k != "password_hash"}
+
+    return AuthResponse(
+        accessToken=access_token,
+        refreshToken=refresh_token,
+        user=user_data
+    )
+
+@api_router.post("/auth/login", response_model=AuthResponse)
+async def login(request: LoginRequest):
+    """Login a user"""
+    # Find user by email
+    user = None
+    for u in users_store.values():
+        if u["email"] == request.email:
+            user = u
+            break
+
+    if not user or not verify_password(request.password, user["password_hash"]):
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Invalid email or password"
+        )
+
+    # Generate tokens
+    access_token = create_access_token(user["id"], user["email"])
+    refresh_token = create_refresh_token(user["id"])
+
+    # Return user without password
+    user_data = {k: v for k, v in user.items() if k != "password_hash"}
+
+    return AuthResponse(
+        accessToken=access_token,
+        refreshToken=refresh_token,
+        user=user_data
+    )
+
+@api_router.post("/auth/refresh")
+async def refresh(request: RefreshRequest):
+    """Refresh access token using refresh token"""
+    user_id = verify_refresh_token(request.refreshToken)
+
+    if not user_id:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Invalid or expired refresh token"
+        )
+
+    # Get user
+    user = users_store.get(user_id)
+    if not user:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="User not found"
+        )
+
+    # Revoke old refresh token
+    revoke_refresh_token(request.refreshToken)
+
+    # Generate new tokens
+    access_token = create_access_token(user["id"], user["email"])
+    new_refresh_token = create_refresh_token(user["id"])
+
+    return {
+        "accessToken": access_token,
+        "refreshToken": new_refresh_token
+    }
+
+@api_router.get("/auth/me")
+async def get_me(current_user: dict = Depends(get_current_user)):
+    """Get current user info"""
+    user_id = current_user["id"]
+    user = users_store.get(user_id)
+
+    if user:
+        # Return user from store without password
+        return {"user": {k: v for k, v in user.items() if k != "password_hash"}}
+
+    # If not in store (e.g., StackForDevs token), return the current_user from token
+    return {"user": current_user}
+
+# ==================== DATA ROUTES ====================
 
 @api_router.get("/games/live", response_model=List[Game])
 async def get_live_games():
